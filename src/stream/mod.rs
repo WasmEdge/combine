@@ -1787,7 +1787,7 @@ macro_rules! decode_tokio_03 {
 ///     );
 /// }
 /// ```
-#[cfg(feature = "tokio")]
+#[cfg(any(feature = "tokio", feature = "tokio_wasi"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 #[macro_export]
 macro_rules! decode_tokio {

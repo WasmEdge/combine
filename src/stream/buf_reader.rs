@@ -4,15 +4,12 @@ use std::io::{self, BufRead, Read};
     feature = "futures-03",
     feature = "tokio-02",
     feature = "tokio-03",
-    feature = "tokio"
+    feature = "tokio",
+    feature = "tokio_wasi"
 ))]
 use std::pin::Pin;
 
-#[cfg(any(
-    feature = "futures-03",
-    feature = "tokio-02",
-    feature = "tokio-03"
-))]
+#[cfg(any(feature = "futures-03", feature = "tokio-02", feature = "tokio-03"))]
 use std::mem::MaybeUninit;
 
 #[cfg(feature = "futures-core-03")]
@@ -31,6 +28,9 @@ use tokio_03_dep::io::AsyncBufRead as _;
 
 #[cfg(feature = "tokio")]
 use tokio_dep::io::AsyncBufRead as _;
+
+#[cfg(feature = "tokio_wasi")]
+use tokio_wasi_dep::io::AsyncBufRead as _;
 
 #[cfg(feature = "futures-core-03")]
 use futures_core_03::ready;
@@ -110,7 +110,12 @@ impl<R> BufReader<R> {
 
     /// Invalidates all data in the internal buffer.
     #[inline]
-    #[cfg(any(feature = "tokio-02", feature = "tokio-03", feature = "tokio"))]
+    #[cfg(any(
+        feature = "tokio-02",
+        feature = "tokio-03",
+        feature = "tokio",
+        feature = "tokio_wasi"
+    ))]
     fn discard_buffer(self: Pin<&mut Self>) {
         let me = self.project();
         me.buf.clear();
@@ -136,7 +141,12 @@ pub trait CombineSyncRead<R>: CombineBuffer<R> {
     fn extend_buf_sync(&mut self, read: &mut R) -> io::Result<usize>;
 }
 
-#[cfg(any(feature = "tokio-02", feature = "tokio-03", feature = "tokio"))]
+#[cfg(any(
+    feature = "tokio-02",
+    feature = "tokio-03",
+    feature = "tokio",
+    feature = "tokio_wasi"
+))]
 #[doc(hidden)]
 pub trait CombineRead<R, T: ?Sized>: CombineBuffer<R> {
     fn poll_extend_buf(
@@ -327,6 +337,33 @@ fn tokio_read_buf(
     tokio_util::io::poll_read_buf(read, cx, bs)
 }
 
+#[cfg(feature = "tokio_wasi")]
+impl<R> CombineRead<R, dyn tokio_wasi_dep::io::AsyncRead> for Buffer
+where
+    R: tokio_wasi_dep::io::AsyncRead,
+{
+    fn poll_extend_buf(
+        &mut self,
+        cx: &mut Context<'_>,
+        read: Pin<&mut R>,
+    ) -> Poll<io::Result<usize>> {
+        tokio_read_buf(read, cx, &mut self.0)
+    }
+}
+
+#[cfg(feature = "tokio_wasi")]
+fn tokio_read_buf(
+    read: Pin<&mut impl tokio_wasi_dep::io::AsyncRead>,
+    cx: &mut Context<'_>,
+    bs: &mut bytes::BytesMut,
+) -> Poll<io::Result<usize>> {
+    if !bs.has_remaining_mut() {
+        bs.reserve(8 * 1024);
+    }
+
+    tokio_util::io::poll_read_buf(read, cx, bs)
+}
+
 /// Marker used by `Decoder` for an external buffer
 #[derive(Default)]
 pub struct Bufferless;
@@ -446,6 +483,22 @@ where
 impl<R> CombineRead<BufReader<R>, dyn tokio_dep::io::AsyncRead> for Bufferless
 where
     R: tokio_dep::io::AsyncRead,
+{
+    fn poll_extend_buf(
+        &mut self,
+        cx: &mut Context<'_>,
+        read: Pin<&mut BufReader<R>>,
+    ) -> Poll<io::Result<usize>> {
+        let me = read.project();
+
+        tokio_read_buf(me.inner, cx, me.buf)
+    }
+}
+
+#[cfg(feature = "tokio_wasi")]
+impl<R> CombineRead<BufReader<R>, dyn tokio_wasi_dep::io::AsyncRead> for Bufferless
+where
+    R: tokio_wasi_dep::io::AsyncRead,
 {
     fn poll_extend_buf(
         &mut self,
@@ -713,6 +766,69 @@ impl<R: tokio_dep::io::AsyncRead> tokio_dep::io::AsyncBufRead for BufReader<R> {
 #[cfg(feature = "tokio")]
 impl<R: tokio_dep::io::AsyncRead + tokio_dep::io::AsyncWrite> tokio_dep::io::AsyncWrite
     for BufReader<R>
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.get_pin_mut().poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_pin_mut().poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_pin_mut().poll_shutdown(cx)
+    }
+}
+
+#[cfg(feature = "tokio_wasi")]
+impl<R: tokio_wasi_dep::io::AsyncRead> tokio_wasi_dep::io::AsyncRead for BufReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio_wasi_dep::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // If we don't have any buffered data and we're doing a massive read
+        // (larger than our internal buffer), bypass our internal buffer
+        // entirely.
+        if !self.buf.has_remaining_mut() && buf.remaining() >= self.buf.len() {
+            let res = ready!(self.as_mut().get_pin_mut().poll_read(cx, buf));
+            self.discard_buffer();
+            return Poll::Ready(res);
+        }
+        let rem = ready!(self.as_mut().poll_fill_buf(cx))?;
+        let amt = std::cmp::min(rem.len(), buf.remaining());
+        buf.put_slice(&rem[..amt]);
+        self.consume(amt);
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(feature = "tokio_wasi")]
+impl<R: tokio_wasi_dep::io::AsyncRead> tokio_wasi_dep::io::AsyncBufRead for BufReader<R> {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        let me = self.project();
+
+        // If we've reached the end of our internal buffer then we need to fetch
+        // some more data from the underlying reader.
+        if me.buf.is_empty() {
+            ready!(tokio_read_buf(me.inner, cx, me.buf))?;
+        }
+        Poll::Ready(Ok(&me.buf[..]))
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        let me = self.project();
+        me.buf.advance(amt);
+    }
+}
+
+#[cfg(feature = "tokio_wasi")]
+impl<R: tokio_wasi_dep::io::AsyncRead + tokio_wasi_dep::io::AsyncWrite>
+    tokio_wasi_dep::io::AsyncWrite for BufReader<R>
 {
     fn poll_write(
         self: Pin<&mut Self>,

@@ -136,7 +136,7 @@ impl<S, P, C> Decoder<S, P, C> {
 
 impl<S, P, C> Decoder<S, P, C>
 where
-    C: ,
+    C:,
 {
     #[doc(hidden)]
     pub fn __before_parse<R>(&mut self, mut reader: R) -> io::Result<()>
@@ -197,6 +197,25 @@ impl<S, P, C> Decoder<S, P, C> {
     where
         R: tokio_dep::io::AsyncRead,
         C: crate::stream::buf_reader::CombineRead<R, dyn tokio_dep::io::AsyncRead>,
+    {
+        let copied =
+            crate::future_ext::poll_fn(|cx| self.buffer.poll_extend_buf(cx, reader.as_mut()))
+                .await?;
+        if copied == 0 {
+            self.end_of_input = true;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "tokio_wasi")]
+impl<S, P, C> Decoder<S, P, C> {
+    #[doc(hidden)]
+    pub async fn __before_parse_tokio<R>(&mut self, mut reader: Pin<&mut R>) -> io::Result<()>
+    where
+        R: tokio_wasi_dep::io::AsyncRead,
+        C: crate::stream::buf_reader::CombineRead<R, dyn tokio_wasi_dep::io::AsyncRead>,
     {
         let copied =
             crate::future_ext::poll_fn(|cx| self.buffer.poll_extend_buf(cx, reader.as_mut()))
